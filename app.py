@@ -1813,7 +1813,8 @@ def pwa_manifest():
         "categories": ["security", "utilities"],
         "icons": [
             {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
-            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/app_icon.jpg", "sizes": "1024x1024", "type": "image/jpeg", "purpose": "any"}
         ],
         "shortcuts": [
             {"name": "Analyzer", "short_name": "Analyze", "url": "/analyzer", "description": "Open Threat Analyzer"},
@@ -1831,45 +1832,59 @@ def pwa_sw():
     return Response(SW_JS, mimetype="application/javascript",
         headers={"Service-Worker-Allowed": "/"})
 
-def _make_png(size, bg=(9,12,21), border_col=(0,212,255)):
-    """Generate a minimal PNG icon with dark bg + cyan border"""
+def _get_icon_bytes():
+    """Return AI-generated icon bytes if available, else fallback PNG"""
+    # Try AI-generated icon first (app_icon.jpg in project folder)
+    icon_path = BASE_DIR / "app_icon.jpg"
+    if icon_path.exists():
+        with open(str(icon_path), "rb") as f:
+            return f.read(), "image/jpeg"
+    # Fallback: programmatic PNG
     import struct, zlib
     def chunk(n, d):
         c = n + d
         return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    size = 192
     sig = b'\x89PNG\r\n\x1a\n'
     ihdr = struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)
-    bw = max(6, size // 20)   # border width
-    r1, g1, b1 = bg
-    r2, g2, b2 = border_col
-    # Shield-ish: solid bg + thick cyan border
+    bw = 10; r1,g1,b1 = 9,12,21; r2,g2,b2 = 0,212,255
+    cx,cy = size//2,size//2
     rows = []
-    cx, cy = size // 2, size // 2
     for y in range(size):
-        row = b'\x00'  # PNG filter byte
+        row = b'\x00'
         for x in range(size):
-            on_border = x < bw or x >= size-bw or y < bw or y >= size-bw
-            # Accent dot in center for recognition
-            in_dot = ((x-cx)**2 + (y-cy)**2) <= (size//6)**2
-            if on_border or in_dot:
-                row += bytes([r2, g2, b2])
+            if x<bw or x>=size-bw or y<bw or y>=size-bw or ((x-cx)**2+(y-cy)**2)<=(size//6)**2:
+                row += bytes([r2,g2,b2])
             else:
-                row += bytes([r1, g1, b1])
+                row += bytes([r1,g1,b1])
         rows.append(row)
     raw = b''.join(rows)
-    return sig + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b'')
+    return sig + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''), "image/png"
 
 @app.route("/icon-192.png")
 def icon_192():
     from flask import Response
-    return Response(_make_png(192), mimetype="image/png",
+    data, mime = _get_icon_bytes()
+    return Response(data, mimetype=mime,
         headers={"Cache-Control": "public, max-age=86400"})
 
 @app.route("/icon-512.png")
 def icon_512():
     from flask import Response
-    return Response(_make_png(512), mimetype="image/png",
+    data, mime = _get_icon_bytes()
+    return Response(data, mimetype=mime,
         headers={"Cache-Control": "public, max-age=86400"})
+
+@app.route("/app_icon.jpg")
+def app_icon_direct():
+    """Direct access to the icon file"""
+    from flask import Response
+    icon_path = BASE_DIR / "app_icon.jpg"
+    if icon_path.exists():
+        with open(str(icon_path), "rb") as f:
+            return Response(f.read(), mimetype="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"})
+    return "", 404
 
 if __name__=="__main__":
     host=os.environ.get("HOST","0.0.0.0"); port=int(os.environ.get("PORT",5000))
