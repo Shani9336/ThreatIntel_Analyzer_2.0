@@ -446,6 +446,44 @@ SHARED_FOOTER = """
 </footer>
 """
 
+# ============================================================
+# PWA SUPPORT
+# ============================================================
+PWA_HEAD = """
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#00d4ff">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ThreatIntel">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+"""
+
+SW_JS = """
+const CACHE_NAME = 'threatintel-v2';
+const OFFLINE_PAGES = ['/', '/login', '/signup'];
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(OFFLINE_PAGES)).catch(()=>{}));
+  self.skipWaiting();
+});
+self.addEventListener('activate', event => {
+  event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', event => {
+  if (event.request.method !== 'GET') return;
+  if (event.request.url.includes('/api/')) return;
+  event.respondWith(
+    fetch(event.request).then(res => {
+      const clone = res.clone();
+      caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
+      return res;
+    }).catch(() => caches.match(event.request))
+  );
+});
+"""
+
 SHARED_SCRIPTS = """
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
@@ -455,6 +493,9 @@ function updateIcon(t){const ic=document.getElementById('themeIcon');const lb=do
 initTheme();
 async function checkApi(){try{const r=await fetch('/api/status');const d=await r.json();const b=document.getElementById('apiBadge');if(!b)return;if(d.apis_configured>0){b.style.background='rgba(16,185,129,.15)';b.style.borderColor='#10b981';b.style.color='#10b981';b.innerHTML=`<i class="bi bi-check-circle-fill me-1"></i>${d.apis_configured} Feed(s) Active`;}else{b.style.color='#f59e0b';b.innerHTML='Simulated Mode';}}catch(e){}}
 document.addEventListener('DOMContentLoaded',checkApi);
+if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('/sw.js').then(()=>console.log('PWA ready')).catch(()=>{});});}
+let deferredPrompt;
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;const b=document.getElementById('installBtn');if(b){b.style.display='flex';b.onclick=()=>{deferredPrompt.prompt();deferredPrompt=null;b.style.display='none';};}});
 </script>
 """
 
@@ -468,7 +509,7 @@ LOGIN_TEMPLATE = """<!DOCTYPE html>
 <title>Login — ThreatIntel Analyzer 2.0</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-""" + THEME_CSS + """
+""" + PWA_HEAD + THEME_CSS + """
 </head>
 <body>
 """ + SHARED_NAVBAR + """
@@ -531,7 +572,7 @@ SIGNUP_TEMPLATE = """<!DOCTYPE html>
 <title>Sign Up — ThreatIntel Analyzer 2.0</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-""" + THEME_CSS + """
+""" + PWA_HEAD + THEME_CSS + """
 </head>
 <body>
 """ + SHARED_NAVBAR + """
@@ -627,7 +668,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <title>Dashboard — ThreatIntel Analyzer 2.0</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-""" + THEME_CSS + """
+""" + PWA_HEAD + THEME_CSS + """
 </head>
 <body>
 """ + SHARED_NAVBAR + """
@@ -728,7 +769,7 @@ ADMIN_LOGS_TEMPLATE = """<!DOCTYPE html>
 <title>Admin Panel — ThreatIntel Analyzer 2.0</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-""" + THEME_CSS + """
+""" + PWA_HEAD + THEME_CSS + """
 </head>
 <body>
 """ + SHARED_NAVBAR + """
@@ -893,7 +934,7 @@ HOME_TEMPLATE = r"""<!DOCTYPE html>
 <title>ThreatIntel Analyzer 2.0 — Enterprise SOC Platform</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-""" + THEME_CSS + r"""
+""" + PWA_HEAD + THEME_CSS + r"""
 <style>
 .hero-section{min-height:90vh;display:flex;align-items:center;position:relative;overflow:hidden;background:var(--bg);border-bottom:1px solid var(--border)}
 .hero-bg{position:absolute;inset:0;background:radial-gradient(ellipse at 20% 30%,rgba(0,212,255,.1),transparent 50%),radial-gradient(ellipse at 80% 70%,rgba(139,92,246,.1),transparent 50%)}
@@ -1017,7 +1058,7 @@ MAIN_TEMPLATE = r"""<!DOCTYPE html>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
 <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-""" + THEME_CSS + r"""
+""" + PWA_HEAD + THEME_CSS + r"""
 <style>
 .page-header{padding:1.8rem 0 1.4rem;background:var(--bg);border-bottom:1px solid var(--border);
   background-image:radial-gradient(ellipse at 20% 50%,rgba(0,212,255,.06),transparent 50%),radial-gradient(ellipse at 80% 50%,rgba(139,92,246,.05),transparent 50%)}
@@ -1752,6 +1793,83 @@ def email_ep():
 
 def _browser(url):
     time.sleep(1.2); webbrowser.open(url)
+
+# ============================================================
+# PWA ROUTES
+# ============================================================
+@app.route("/manifest.json")
+def pwa_manifest():
+    from flask import Response
+    manifest = {
+        "name": "ThreatIntel Analyzer 2.0",
+        "short_name": "ThreatIntel",
+        "description": "Enterprise Cyber Threat Intelligence & SOC Automation Platform",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#090c15",
+        "theme_color": "#00d4ff",
+        "orientation": "portrait-primary",
+        "lang": "en-US",
+        "categories": ["security", "utilities"],
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+        ],
+        "shortcuts": [
+            {"name": "Analyzer", "short_name": "Analyze", "url": "/analyzer", "description": "Open Threat Analyzer"},
+            {"name": "Dashboard", "short_name": "Dashboard", "url": "/dashboard", "description": "View your analyses"}
+        ]
+    }
+    return app.response_class(
+        response=json.dumps(manifest, indent=2),
+        mimetype="application/manifest+json"
+    )
+
+@app.route("/sw.js")
+def pwa_sw():
+    from flask import Response
+    return Response(SW_JS, mimetype="application/javascript",
+        headers={"Service-Worker-Allowed": "/"})
+
+def _make_png(size, bg=(9,12,21), border_col=(0,212,255)):
+    """Generate a minimal PNG icon with dark bg + cyan border"""
+    import struct, zlib
+    def chunk(n, d):
+        c = n + d
+        return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+    sig = b'\x89PNG\r\n\x1a\n'
+    ihdr = struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)
+    bw = max(6, size // 20)   # border width
+    r1, g1, b1 = bg
+    r2, g2, b2 = border_col
+    # Shield-ish: solid bg + thick cyan border
+    rows = []
+    cx, cy = size // 2, size // 2
+    for y in range(size):
+        row = b'\x00'  # PNG filter byte
+        for x in range(size):
+            on_border = x < bw or x >= size-bw or y < bw or y >= size-bw
+            # Accent dot in center for recognition
+            in_dot = ((x-cx)**2 + (y-cy)**2) <= (size//6)**2
+            if on_border or in_dot:
+                row += bytes([r2, g2, b2])
+            else:
+                row += bytes([r1, g1, b1])
+        rows.append(row)
+    raw = b''.join(rows)
+    return sig + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b'')
+
+@app.route("/icon-192.png")
+def icon_192():
+    from flask import Response
+    return Response(_make_png(192), mimetype="image/png",
+        headers={"Cache-Control": "public, max-age=86400"})
+
+@app.route("/icon-512.png")
+def icon_512():
+    from flask import Response
+    return Response(_make_png(512), mimetype="image/png",
+        headers={"Cache-Control": "public, max-age=86400"})
 
 if __name__=="__main__":
     host=os.environ.get("HOST","0.0.0.0"); port=int(os.environ.get("PORT",5000))
