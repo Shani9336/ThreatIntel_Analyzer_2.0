@@ -93,11 +93,90 @@ def load_user(user_id):
 # ============================================================
 # DATABASE FUNCTIONS
 # ============================================================
-def get_db():
-    conn=sqlite3.connect(str(DB_PATH)); conn.row_factory=sqlite3.Row; return conn
+# ============================================================
+# DATABASE LAYER — SQLite (local dev) + PostgreSQL (production)
+# ============================================================
+DATABASE_URL = os.environ.get("DATABASE_URL")
+IS_PG = bool(DATABASE_URL)
+
+def _sql(q):
+    """Convert SQLite ? placeholders to %s for PostgreSQL"""
+    return q.replace("?", "%s") if IS_PG else q
+
+class DB:
+    """Unified DB connection — works with both SQLite and PostgreSQL"""
+    def __init__(self):
+        if IS_PG:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            self._conn = psycopg2.connect(DATABASE_URL)
+            self._RDC = RealDictCursor
+        else:
+            self._conn = sqlite3.connect(str(DB_PATH))
+            self._conn.row_factory = sqlite3.Row
+        self._is_pg = IS_PG
+
+    def execute(self, sql, params=()):
+        if self._is_pg:
+            cur = self._conn.cursor(cursor_factory=self._RDC)
+            cur.execute(sql, params)
+            return cur
+        return self._conn.execute(sql, params)
+
+    def execute_id(self, sql, params=()):
+        """Execute INSERT and return new row id"""
+        if self._is_pg:
+            cur = self._conn.cursor()
+            cur.execute(sql + " RETURNING id", params)
+            r = cur.fetchone()
+            return r[0] if r else None
+        cur = self._conn.execute(sql, params)
+        return cur.lastrowid
+
+    def commit(self): self._conn.commit()
+    def close(self):
+        try: self._conn.close()
+        except: pass
+    def __enter__(self): return self
+    def __exit__(self, exc, *a):
+        if not exc:
+            try: self._conn.commit()
+            except: pass
+        else:
+            try: self._conn.rollback()
+            except: pass
+        self.close()
+
+def get_db(): return DB()
 
 def init_db():
-    with get_db() as conn:
+    if IS_PG:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS cache(
+            id SERIAL PRIMARY KEY, indicator TEXT UNIQUE, indicator_type TEXT,
+            risk_score INTEGER, threat_level TEXT, json_response TEXT,
+            created_at TIMESTAMP DEFAULT NOW())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS users(
+            id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'user', created_at TIMESTAMP DEFAULT NOW())""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS user_analyses(
+            id SERIAL PRIMARY KEY, user_id INTEGER, username TEXT,
+            indicator TEXT, indicator_type TEXT, risk_score INTEGER,
+            threat_level TEXT, reputation TEXT,
+            analyzed_at TIMESTAMP DEFAULT NOW(),
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS activity_logs(
+            id SERIAL PRIMARY KEY, user_id INTEGER, username TEXT,
+            action TEXT, details TEXT, ip_address TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        conn.commit(); conn.close()
+        logger.info("✅ PostgreSQL tables initialized (persistent storage)")
+    else:
+        conn = sqlite3.connect(str(DB_PATH))
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS cache(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,63 +204,75 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id));
         """)
-        conn.commit()
+        conn.commit(); conn.close()
+        logger.info("✅ SQLite tables initialized (local dev mode)")
 
-def db_create_user(username,email,password_hash):
+def db_create_user(username, email, password_hash):
     try:
-        with get_db() as conn:
-            cur=conn.execute("INSERT INTO users(username,email,password_hash) VALUES(?,?,?)",(username,email,password_hash))
-            conn.commit(); return cur.lastrowid
+        with get_db() as db:
+            return db.execute_id(
+                _sql("INSERT INTO users(username,email,password_hash) VALUES(?,?,?)"),
+                (username, email, password_hash))
     except Exception: return None
 
 def db_get_user_by_email(email):
-    with get_db() as conn:
-        return conn.execute("SELECT * FROM users WHERE email=?",(email,)).fetchone()
+    with get_db() as db:
+        return db.execute(_sql("SELECT * FROM users WHERE email=?"), (email,)).fetchone()
 
 def db_get_user_by_id(uid):
-    with get_db() as conn:
-        return conn.execute("SELECT * FROM users WHERE id=?",(uid,)).fetchone()
+    with get_db() as db:
+        return db.execute(_sql("SELECT * FROM users WHERE id=?"), (uid,)).fetchone()
 
-def db_log_activity(user_id,username,action,details,ip):
+def db_log_activity(user_id, username, action, details, ip):
     try:
-        with get_db() as conn:
-            conn.execute("INSERT INTO activity_logs(user_id,username,action,details,ip_address) VALUES(?,?,?,?,?)",
-                (user_id,username,action,details,ip)); conn.commit()
+        with get_db() as db:
+            db.execute(_sql("INSERT INTO activity_logs(user_id,username,action,details,ip_address) VALUES(?,?,?,?,?)"),
+                (user_id, username, action, details, ip))
     except Exception: pass
 
-def db_save_analysis(user_id,username,indicator,itype,score,level,rep):
+def db_save_analysis(user_id, username, indicator, itype, score, level, rep):
     try:
-        with get_db() as conn:
-            conn.execute("INSERT INTO user_analyses(user_id,username,indicator,indicator_type,risk_score,threat_level,reputation) VALUES(?,?,?,?,?,?,?)",
-                (user_id,username,indicator,itype,score,level,rep)); conn.commit()
+        with get_db() as db:
+            db.execute(_sql("INSERT INTO user_analyses(user_id,username,indicator,indicator_type,risk_score,threat_level,reputation) VALUES(?,?,?,?,?,?,?)"),
+                (user_id, username, indicator, itype, score, level, rep))
     except Exception: pass
 
-def db_get_user_analyses(user_id,limit=50):
-    with get_db() as conn:
-        return conn.execute("SELECT * FROM user_analyses WHERE user_id=? ORDER BY analyzed_at DESC LIMIT ?",(user_id,limit)).fetchall()
+def db_get_user_analyses(user_id, limit=50):
+    with get_db() as db:
+        return db.execute(
+            _sql("SELECT * FROM user_analyses WHERE user_id=? ORDER BY analyzed_at DESC LIMIT ?"),
+            (user_id, limit)).fetchall()
 
 def db_get_all_logs(limit=200):
-    with get_db() as conn:
-        return conn.execute("SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()
+    with get_db() as db:
+        return db.execute(
+            _sql("SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT ?"),
+            (limit,)).fetchall()
 
 def db_get_all_analyses(limit=200):
-    with get_db() as conn:
-        return conn.execute("SELECT * FROM user_analyses ORDER BY analyzed_at DESC LIMIT ?",(limit,)).fetchall()
+    with get_db() as db:
+        return db.execute(
+            _sql("SELECT * FROM user_analyses ORDER BY analyzed_at DESC LIMIT ?"),
+            (limit,)).fetchall()
 
 def db_get_admin_stats():
-    with get_db() as conn:
-        total_users=conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        total_analyses=conn.execute("SELECT COUNT(*) FROM user_analyses").fetchone()[0]
-        today=datetime.utcnow().strftime("%Y-%m-%d")
-        today_analyses=conn.execute("SELECT COUNT(*) FROM user_analyses WHERE analyzed_at >= ?",(today,)).fetchone()[0]
-        critical=conn.execute("SELECT COUNT(*) FROM user_analyses WHERE threat_level='Critical'").fetchone()[0]
-        return {"total_users":total_users,"total_analyses":total_analyses,"today_analyses":today_analyses,"critical_finds":critical}
+    with get_db() as db:
+        tu = db.execute("SELECT COUNT(*) AS c FROM users").fetchone()
+        ta = db.execute("SELECT COUNT(*) AS c FROM user_analyses").fetchone()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        tda = db.execute(_sql("SELECT COUNT(*) AS c FROM user_analyses WHERE CAST(analyzed_at AS TEXT) >= ?"), (today,)).fetchone()
+        cr = db.execute("SELECT COUNT(*) AS c FROM user_analyses WHERE threat_level='Critical'").fetchone()
+        def _c(r): return (r["c"] if r else 0)
+        return {"total_users": _c(tu), "total_analyses": _c(ta),
+                "today_analyses": _c(tda), "critical_finds": _c(cr)}
 
 def db_get_all_users():
-    with get_db() as conn:
-        return conn.execute("SELECT id,username,email,role,created_at FROM users ORDER BY created_at DESC").fetchall()
+    with get_db() as db:
+        return db.execute(
+            "SELECT id,username,email,role,created_at FROM users ORDER BY created_at DESC").fetchall()
 
 init_db()
+
 
 # ============================================================
 # SIEM & DEFANG
@@ -1397,25 +1488,36 @@ class ThreatIntelAnalyzer:
         self.vt_key=os.environ.get("VT_API_KEY","").strip().strip('"').strip("'")
         self.abuse_key=os.environ.get("ABUSEIPDB_KEY","").strip().strip('"').strip("'")
 
-    def check_cache(self,indicator):
+    def check_cache(self, indicator):
         try:
-            with get_db() as conn:
-                row=conn.execute("SELECT * FROM cache WHERE indicator=?",(indicator,)).fetchone()
+            with get_db() as db:
+                row = db.execute(_sql("SELECT * FROM cache WHERE indicator=?"), (indicator,)).fetchone()
                 if row:
-                    ca=datetime.fromisoformat(str(row["created_at"]).replace('Z',''))
-                    if datetime.utcnow()-ca<timedelta(hours=self.CACHE_TTL_HOURS):
-                        d=json.loads(row["json_response"]); d["from_cache"]=True; return d
+                    ca = datetime.fromisoformat(str(row["created_at"]).replace('Z','').split('.')[0])
+                    if datetime.utcnow() - ca < timedelta(hours=self.CACHE_TTL_HOURS):
+                        d = json.loads(row["json_response"]); d["from_cache"] = True; return d
         except Exception: pass
         return None
 
-    def cache_result(self,indicator,data):
+    def cache_result(self, indicator, data):
         try:
-            with get_db() as conn:
-                conn.execute("""INSERT INTO cache(indicator,indicator_type,risk_score,threat_level,json_response)
-                    VALUES(?,?,?,?,?) ON CONFLICT(indicator) DO UPDATE SET
-                    json_response=excluded.json_response,created_at=CURRENT_TIMESTAMP""",
-                    (indicator,data.get("indicator_type"),data.get("risk_score"),data.get("threat_level"),json.dumps(data)))
-                conn.commit()
+            with get_db() as db:
+                if IS_PG:
+                    db.execute("""INSERT INTO cache(indicator,indicator_type,risk_score,threat_level,json_response)
+                        VALUES(%s,%s,%s,%s,%s)
+                        ON CONFLICT(indicator) DO UPDATE SET
+                        json_response=EXCLUDED.json_response,
+                        risk_score=EXCLUDED.risk_score,
+                        threat_level=EXCLUDED.threat_level,
+                        created_at=NOW()""",
+                        (indicator, data.get("indicator_type"), data.get("risk_score"),
+                         data.get("threat_level"), json.dumps(data)))
+                else:
+                    db.execute("""INSERT INTO cache(indicator,indicator_type,risk_score,threat_level,json_response)
+                        VALUES(?,?,?,?,?) ON CONFLICT(indicator) DO UPDATE SET
+                        json_response=excluded.json_response,created_at=CURRENT_TIMESTAMP""",
+                        (indicator, data.get("indicator_type"), data.get("risk_score"),
+                         data.get("threat_level"), json.dumps(data)))
         except Exception: pass
 
     def extract_iocs(self,text):
