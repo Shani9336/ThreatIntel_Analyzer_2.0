@@ -1,35 +1,47 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.egg-info/
-dist/
-build/
+# ThreatIntel Analyzer 2.0 — Git Ignore
+# Do NOT commit secrets or local data to GitHub
 
-# Environment & Secrets (NEVER commit these!)
+# ── Secrets & Environment ─────────────────────────────────
 .env
 *.env
+.env.*
 
-# Database (auto-created at runtime)
-*.db
+# ── Database (local SQLite only — use PostgreSQL on Render) ──
 threat_cache.db
+threat_cache.db-shm
+threat_cache.db-wal
+*.db
 
-# Generated files
-logs/
+# ── Generated Reports & Logs ──────────────────────────────
 reports/
-*.pdf
+logs/
 *.log
 
-# Virtual environment
+# ── Python Cache ─────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.py[cod]
+
+# ── Virtual Environment ──────────────────────────────────
 venv/
 env/
 .venv/
+.env/
+ENV/
 
-# IDE
+# ── IDE & System ─────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
-
-# OS
+*.swo
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ── Build artifacts ──────────────────────────────────────
+dist/
+build/
+*.egg-info/

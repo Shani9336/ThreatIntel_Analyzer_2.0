@@ -6,3 +6,4 @@ python-whois>=0.9.3
 reportlab>=4.1.0
 python-dotenv>=1.0.1
 psycopg2-binary>=2.9.9
+Werkzeug>=3.0.0

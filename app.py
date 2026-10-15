@@ -52,7 +52,49 @@ logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(nam
 logger=logging.getLogger("threatintel")
 
 app=Flask(__name__)
-app.secret_key=os.environ.get("FLASK_SECRET_KEY","threatintel-super-secret-v2-2026")
+
+# ── Permanent Secret Key: auto-generated ONCE and saved to .env ────────────────
+# If FLASK_SECRET_KEY is not set or too short, generate a strong one and
+# WRITE it into .env so it survives every server restart permanently.
+_secret = os.environ.get("FLASK_SECRET_KEY", "").strip().strip('"').strip("'")
+if not _secret or len(_secret) < 32:
+    import secrets as _sec
+    _secret = _sec.token_hex(32)
+    # Persist to .env so every restart uses the SAME key
+    _env_path = BASE_DIR / ".env"
+    try:
+        if _env_path.exists():
+            _env_content = _env_path.read_text(encoding="utf-8")
+            if "FLASK_SECRET_KEY" in _env_content:
+                import re as _re
+                _env_content = _re.sub(
+                    r"^FLASK_SECRET_KEY=.*$", f"FLASK_SECRET_KEY={_secret}",
+                    _env_content, flags=_re.MULTILINE
+                )
+            else:
+                _env_content += f"\nFLASK_SECRET_KEY={_secret}\n"
+            _env_path.write_text(_env_content, encoding="utf-8")
+        else:
+            _env_path.write_text(f"FLASK_SECRET_KEY={_secret}\n", encoding="utf-8")
+        os.environ["FLASK_SECRET_KEY"] = _secret
+        logger.info(f"✅ FLASK_SECRET_KEY auto-generated and saved to .env — sessions will now persist across restarts!")
+    except Exception as _e:
+        logger.warning(f"⚠️  Could not save FLASK_SECRET_KEY to .env: {_e} — sessions will reset on restart!")
+else:
+    logger.info(f"✅ FLASK_SECRET_KEY loaded from .env ({len(_secret)} chars) — sessions are permanent.")
+app.secret_key = _secret
+
+
+# ── Permanent authentication configuration ──────────────────────────────────────
+app.config["REMEMBER_COOKIE_DURATION"]     = timedelta(days=365)  # Stay logged in 1 year
+app.config["REMEMBER_COOKIE_SECURE"]       = False   # Set True when using HTTPS in production
+app.config["REMEMBER_COOKIE_HTTPONLY"]     = True    # JS cannot read the cookie
+app.config["REMEMBER_COOKIE_SAMESITE"]     = "Lax"
+app.config["SESSION_COOKIE_HTTPONLY"]      = True
+app.config["SESSION_COOKIE_SAMESITE"]      = "Lax"
+app.config["SESSION_COOKIE_SECURE"]        = False   # Set True when using HTTPS in production
+app.config["PERMANENT_SESSION_LIFETIME"]   = timedelta(days=365)  # Session lasts 1 year
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True    # Reset 365-day timer on every visit
 
 login_manager=LoginManager()
 login_manager.init_app(app)
@@ -91,8 +133,49 @@ def load_user(user_id):
     return None
 
 # ============================================================
-# DATABASE FUNCTIONS
+# CSRF PROTECTION (lightweight, no extra packages required)
 # ============================================================
+import secrets as _secrets_mod
+from flask import session as _flask_session
+
+def generate_csrf_token():
+    """Generate and store a CSRF token in the session."""
+    if "_csrf_token" not in _flask_session:
+        _flask_session["_csrf_token"] = _secrets_mod.token_hex(32)
+    return _flask_session["_csrf_token"]
+
+def validate_csrf_token():
+    """Validate the CSRF token from form submission."""
+    token = _flask_session.get("_csrf_token","")
+    form_token = request.form.get("_csrf_token","")
+    if not token or not form_token or token != form_token:
+        return False
+    return True
+
+# Inject CSRF token into all templates
+app.jinja_env.globals["csrf_token"] = generate_csrf_token
+
+# ============================================================
+# RATE LIMITER (simple in-memory per-IP, no extra packages)
+# ============================================================
+_rate_store = {}  # {ip: [timestamp, ...]}
+_RATE_LIMIT   = 30   # max requests per window
+_RATE_WINDOW  = 60   # seconds window
+
+def check_rate_limit(ip):
+    """Returns True if request is allowed, False if rate limited."""
+    now = time.time()
+    window_start = now - _RATE_WINDOW
+    hits = _rate_store.get(ip, [])
+    hits = [t for t in hits if t > window_start]  # remove old hits
+    if len(hits) >= _RATE_LIMIT:
+        _rate_store[ip] = hits
+        return False
+    hits.append(now)
+    _rate_store[ip] = hits
+    return True
+
+
 # ============================================================
 # DATABASE LAYER — SQLite (local dev) + PostgreSQL (production)
 # ============================================================
@@ -112,8 +195,12 @@ class DB:
             self._conn = psycopg2.connect(DATABASE_URL)
             self._RDC = RealDictCursor
         else:
-            self._conn = sqlite3.connect(str(DB_PATH))
+            self._conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            # WAL mode: allows concurrent reads while writing — prevents "database is locked"
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")  # wait 5s before giving up
+            self._conn.execute("PRAGMA synchronous=NORMAL")  # faster + safe in WAL
         self._is_pg = IS_PG
 
     def execute(self, sql, params=()):
@@ -173,6 +260,14 @@ def init_db():
             action TEXT, details TEXT, ip_address TEXT,
             created_at TIMESTAMP DEFAULT NOW(),
             FOREIGN KEY(user_id) REFERENCES users(id))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS password_reset_tokens(
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            expires_at TIMESTAMP NOT NULL,
+            used INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
         conn.commit(); conn.close()
         logger.info("✅ PostgreSQL tables initialized (persistent storage)")
     else:
@@ -203,6 +298,14 @@ def init_db():
             action TEXT,details TEXT,ip_address TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id));
+        CREATE TABLE IF NOT EXISTS password_reset_tokens(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NOT NULL,
+            used INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id));
         """)
         conn.commit(); conn.close()
         logger.info("✅ SQLite tables initialized (local dev mode)")
@@ -218,6 +321,10 @@ def db_create_user(username, email, password_hash):
 def db_get_user_by_email(email):
     with get_db() as db:
         return db.execute(_sql("SELECT * FROM users WHERE email=?"), (email,)).fetchone()
+
+def db_get_user_by_username(username):
+    with get_db() as db:
+        return db.execute(_sql("SELECT * FROM users WHERE username=?"), (username,)).fetchone()
 
 def db_get_user_by_id(uid):
     with get_db() as db:
@@ -271,11 +378,152 @@ def db_get_all_users():
         return db.execute(
             "SELECT id,username,email,role,created_at FROM users ORDER BY created_at DESC").fetchall()
 
+# ── Password Reset DB Functions ───────────────────────────────────────────────
+def db_create_reset_token(user_id):
+    """Create a secure 1-hour reset token, invalidate old ones first."""
+    import secrets as _s
+    token = _s.token_urlsafe(48)
+    expires = (datetime.utcnow() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with get_db() as db:
+            # Invalidate all previous unused tokens for this user
+            db.execute(_sql("UPDATE password_reset_tokens SET used=1 WHERE user_id=? AND used=0"),
+                       (user_id,))
+            db.execute(_sql(
+                "INSERT INTO password_reset_tokens(user_id,token,expires_at) VALUES(?,?,?)"),
+                (user_id, token, expires))
+        return token
+    except Exception as e:
+        logger.error(f"db_create_reset_token error: {e}")
+        return None
+
+def db_get_reset_token(token):
+    """Return the token row if valid (not used, not expired)."""
+    with get_db() as db:
+        row = db.execute(_sql(
+            "SELECT * FROM password_reset_tokens WHERE token=? AND used=0"), (token,)).fetchone()
+        if not row:
+            return None
+        # Check expiry
+        try:
+            exp_val = row["expires_at"]
+            if isinstance(exp_val, datetime):
+                if datetime.utcnow() > exp_val:
+                    return None  # expired
+            else:
+                exp_str = str(exp_val).split(".")[0].replace("T"," ")
+                if datetime.utcnow() > datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S"):
+                    return None  # expired
+        except Exception:
+            pass
+        return row
+
+def db_use_reset_token(token):
+    """Mark token as used so it can't be reused."""
+    try:
+        with get_db() as db:
+            db.execute(_sql("UPDATE password_reset_tokens SET used=1 WHERE token=?"), (token,))
+    except Exception: pass
+
+def db_update_password(user_id, new_hash):
+    """Update user's password hash."""
+    try:
+        with get_db() as db:
+            db.execute(_sql("UPDATE users SET password_hash=? WHERE id=?"), (new_hash, user_id))
+        return True
+    except Exception: return False
+
+# ── Email Sender (Python built-in smtplib — no extra packages) ───────────────
+def send_reset_email(to_email, username, reset_link):
+    """Send password reset email via Gmail SMTP. Returns True on success."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    mail_user = os.environ.get("MAIL_USERNAME","").strip()
+    mail_pass = os.environ.get("MAIL_PASSWORD","").strip()
+    mail_server = os.environ.get("MAIL_SERVER","smtp.gmail.com")
+    mail_port = int(os.environ.get("MAIL_PORT","587"))
+
+    if not mail_user or not mail_pass or "your_gmail" in mail_user:
+        logger.warning("Email not configured — password reset email NOT sent. Check .env MAIL_* settings.")
+        return False
+
+    html_body = f"""
+    <div style="font-family:system-ui,sans-serif;max-width:520px;margin:0 auto;background:#090c15;color:#f1f5f9;border-radius:16px;overflow:hidden;border:1px solid #1e293b">
+      <div style="background:linear-gradient(135deg,#00d4ff,#8b5cf6);padding:28px 32px;text-align:center">
+        <div style="font-size:2rem;margin-bottom:8px">🔐</div>
+        <h1 style="margin:0;font-size:1.4rem;color:#000;font-weight:800">ThreatIntel Analyzer 2.0</h1>
+        <p style="margin:6px 0 0;color:#0f172a;font-size:0.85rem">Password Reset Request</p>
+      </div>
+      <div style="padding:32px">
+        <p style="color:#94a3b8;font-size:0.9rem;margin:0 0 16px">Hi <strong style="color:#f1f5f9">{username}</strong>,</p>
+        <p style="color:#94a3b8;font-size:0.9rem;margin:0 0 24px">
+          We received a request to reset the password for your ThreatIntel account.
+          Click the button below to set a new password. This link expires in <strong style="color:#f59e0b">1 hour</strong>.
+        </p>
+        <div style="text-align:center;margin:28px 0">
+          <a href="{reset_link}"
+            style="background:linear-gradient(135deg,#00d4ff,#0284c7);color:#000;text-decoration:none;
+                   padding:14px 36px;border-radius:10px;font-weight:800;font-size:1rem;display:inline-block">
+            🔑 Reset My Password
+          </a>
+        </div>
+        <p style="color:#64748b;font-size:0.78rem;margin:20px 0 0">
+          If you didn't request a password reset, ignore this email — your account is safe.<br>
+          This link can only be used once and expires in 1 hour.
+        </p>
+        <hr style="border:none;border-top:1px solid #1e293b;margin:24px 0">
+        <p style="color:#475569;font-size:0.72rem;text-align:center;margin:0">
+          ThreatIntel Analyzer 2.0 &middot; TLP:AMBER &middot; Restricted
+        </p>
+      </div>
+    </div>
+    """
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Reset Your ThreatIntel Analyzer Password"
+        msg["From"]    = f"ThreatIntel Analyzer <{mail_user}>"
+        msg["To"]      = to_email
+        msg.attach(MIMEText(f"Reset your password: {reset_link}\n\nExpires in 1 hour.", "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP(mail_server, mail_port, timeout=10) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(mail_user, mail_pass)
+            server.sendmail(mail_user, to_email, msg.as_string())
+        logger.info(f"✅ Password reset email sent to {to_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send reset email: {e}")
+        return False
+
 init_db()
 
+# ── Startup Diagnostics ────────────────────────────────────────────────────────
+def _startup_diagnostics():
+    vt_key    = os.environ.get("VT_API_KEY","").strip()
+    abuse_key = os.environ.get("ABUSEIPDB_KEY","").strip()
+    logger.info("=" * 60)
+    logger.info("ThreatIntel Analyzer 2.0 — Startup Diagnostics")
+    logger.info("=" * 60)
+    logger.info(f"  VirusTotal API Key  : {'✅ SET (%d chars)' % len(vt_key) if vt_key and len(vt_key)>=32 else '❌ NOT SET or too short (%d chars)' % len(vt_key)}")
+    logger.info(f"  AbuseIPDB API Key   : {'✅ SET (%d chars)' % len(abuse_key) if abuse_key and len(abuse_key)>=32 else '❌ NOT SET or too short (%d chars)' % len(abuse_key)}")
+    logger.info(f"  requests library    : {'✅ Available' if REQUESTS_OK else '❌ MISSING — pip install requests'}")
+    logger.info(f"  python-whois        : {'✅ Available' if WHOIS_OK else '⚠️  Not installed — pip install python-whois'}")
+    logger.info(f"  reportlab (PDF)     : {'✅ Available' if REPORTLAB_OK else '⚠️  Not installed — pip install reportlab'}")
+    logger.info(f"  Database backend    : {'PostgreSQL' if IS_PG else 'SQLite (local dev)'}")
+    if not vt_key or len(vt_key) < 32:
+        logger.warning("  ⚠️  VirusTotal data will be UNAVAILABLE. Set VT_API_KEY in .env")
+    if not abuse_key or len(abuse_key) < 32:
+        logger.warning("  ⚠️  AbuseIPDB data will be UNAVAILABLE. Set ABUSEIPDB_KEY in .env")
+    logger.info("=" * 60)
 
-# ============================================================
-# SIEM & DEFANG
+_startup_diagnostics()
+
+
 # ============================================================
 def generate_siem_queries(indicator,ioc_type):
     q={}
@@ -582,7 +830,7 @@ function initTheme(){const s=localStorage.getItem('ti_theme')||'dark';document.d
 function toggleTheme(){const c=document.documentElement.getAttribute('data-theme');const n=c==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);localStorage.setItem('ti_theme',n);updateIcon(n);}
 function updateIcon(t){const ic=document.getElementById('themeIcon');const lb=document.getElementById('themeLabel');if(!ic)return;if(t==='dark'){ic.className='bi bi-moon-stars-fill';if(lb)lb.innerText='Dark';}else{ic.className='bi bi-sun-fill';if(lb)lb.innerText='Light';}}
 initTheme();
-async function checkApi(){try{const r=await fetch('/api/status');const d=await r.json();const b=document.getElementById('apiBadge');if(!b)return;if(d.apis_configured>0){b.style.background='rgba(16,185,129,.15)';b.style.borderColor='#10b981';b.style.color='#10b981';b.innerHTML=`<i class="bi bi-check-circle-fill me-1"></i>${d.apis_configured} Feed(s) Active`;}else{b.style.color='#f59e0b';b.innerHTML='Simulated Mode';}}catch(e){}}
+async function checkApi(){try{const r=await fetch('/api/status');const d=await r.json();const b=document.getElementById('apiBadge');if(!b)return;if(d.apis_configured>=2){b.style.background='rgba(16,185,129,.15)';b.style.border='1px solid #10b981';b.style.color='#10b981';b.innerHTML=`<i class="bi bi-check-circle-fill me-1"></i>VT + AbuseIPDB Live`;}else if(d.apis_configured===1){b.style.background='rgba(245,158,11,.12)';b.style.border='1px solid #f59e0b';b.style.color='#f59e0b';b.innerHTML=`<i class="bi bi-exclamation-triangle-fill me-1"></i>1 Feed Active`;}else{b.style.background='rgba(239,68,68,.1)';b.style.border='1px solid #ef4444';b.style.color='#ef4444';b.innerHTML=`<i class="bi bi-x-circle-fill me-1"></i>No API Keys`;}}catch(e){}}
 document.addEventListener('DOMContentLoaded',checkApi);
 if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('/sw.js').then(()=>console.log('PWA ready')).catch(()=>{});});}
 let deferredPrompt;
@@ -633,18 +881,27 @@ LOGIN_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
       <div class="d-flex justify-content-between align-items-center mb-4">
-        <label class="d-flex align-items-center gap-2 small" style="color:var(--muted);cursor:pointer">
-          <input type="checkbox" name="remember" style="accent-color:var(--accent)"> Remember me
-        </label>
+        <div class="d-flex align-items-center gap-2 small" style="color:var(--green)">
+          <i class="bi bi-shield-check-fill" style="color:var(--green)"></i>
+          <span style="font-weight:600">You'll stay logged in permanently</span>
+        </div>
+        <a href="/forgot-password" style="color:var(--accent);font-size:.82rem;font-weight:600;text-decoration:none">
+          <i class="bi bi-key me-1"></i>Forgot Password?
+        </a>
       </div>
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="btn-accent w-100 py-2 mb-3" style="font-size:1rem"><i class="bi bi-lightning-charge-fill me-2"></i>Sign In</button>
     </form>
     <div class="text-center" style="color:var(--muted);font-size:.88rem">
       Don't have an account? <a href="/signup" style="color:var(--accent);font-weight:600;text-decoration:none">Sign Up</a>
     </div>
-    <div class="mt-4 p-3" style="background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.15);border-radius:10px">
-      <div style="font-size:.75rem;color:var(--muted);text-align:center"><i class="bi bi-shield-lock me-1" style="color:var(--accent)"></i>Passwords are hashed with PBKDF2-SHA256 &middot; Sessions are encrypted</div>
+    <div class="mt-4 p-3" style="background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.2);border-radius:10px">
+      <div style="font-size:.75rem;color:var(--muted);text-align:center">
+        <i class="bi bi-shield-lock me-1" style="color:#10b981"></i>
+        PBKDF2-SHA256 hashed &middot; Encrypted sessions &middot; <strong style="color:#10b981">Stays logged in for 1 year</strong>
+      </div>
     </div>
+
   </div>
 </div>
 """ + SHARED_SCRIPTS + """
@@ -721,6 +978,7 @@ SIGNUP_TEMPLATE = """<!DOCTYPE html>
           <span>I agree to responsible use of threat intelligence data per <strong style="color:var(--accent)">TLP:AMBER</strong> classification guidelines</span>
         </label>
       </div>
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="btn-accent w-100 py-2 mb-3" style="font-size:1rem"><i class="bi bi-person-plus-fill me-2"></i>Create Account</button>
     </form>
     <div class="text-center" style="color:var(--muted);font-size:.88rem">
@@ -742,6 +1000,142 @@ function checkStrength(p){
 }
 function validateForm(){
   const p=document.getElementById('signPwd').value;const c=document.getElementById('confPwd').value;
+  if(p!==c){alert('Passwords do not match!');return false;}
+  if(p.length<8){alert('Password must be at least 8 characters!');return false;}
+  return true;
+}
+</script>
+</body></html>"""
+
+# ============================================================
+# FORGOT PASSWORD TEMPLATE
+# ============================================================
+FORGOT_PASSWORD_TEMPLATE = """<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forgot Password — ThreatIntel Analyzer 2.0</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+""" + PWA_HEAD + THEME_CSS + """
+</head>
+<body>
+""" + SHARED_NAVBAR + """
+<div class="auth-wrap">
+  <div class="auth-card">
+    <div class="text-center mb-4">
+      <div style="width:60px;height:60px;background:linear-gradient(135deg,#f59e0b,#ef4444);border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.6rem">🔑</div>
+      <h3 class="fw-800 mb-1" style="color:var(--text);font-weight:800">Forgot Password?</h3>
+      <p style="color:var(--muted);font-size:.88rem">Enter your email and we'll send you a reset link</p>
+    </div>
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% for cat,msg in msgs %}
+      <div class="flash-alert flash-{{ cat }}"><i class="bi bi-info-circle me-2"></i>{{ msg|safe }}</div>
+      {% endfor %}
+    {% endwith %}
+    <form method="POST" action="/forgot-password">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="mb-4">
+        <label class="form-label small fw-600" style="color:var(--muted)">Email Address</label>
+        <div class="position-relative">
+          <i class="bi bi-envelope position-absolute" style="left:.9rem;top:50%;transform:translateY(-50%);color:var(--muted)"></i>
+          <input type="email" name="email" class="si ps-5" placeholder="analyst@company.com" required autofocus>
+        </div>
+      </div>
+      <button type="submit" class="btn-accent w-100 py-2 mb-3" style="font-size:1rem">
+        <i class="bi bi-send-fill me-2"></i>Send Reset Link
+      </button>
+    </form>
+    <div class="text-center" style="color:var(--muted);font-size:.88rem">
+      Remembered it? <a href="/login" style="color:var(--accent);font-weight:600;text-decoration:none">Sign In</a>
+    </div>
+    <div class="mt-4 p-3" style="background:rgba(245,158,11,.06);border:1px solid rgba(245,158,11,.2);border-radius:10px">
+      <div style="font-size:.75rem;color:var(--muted);text-align:center">
+        <i class="bi bi-clock me-1" style="color:#f59e0b"></i>Reset link expires in <strong style="color:#f59e0b">1 hour</strong> &middot; One-time use only
+      </div>
+    </div>
+  </div>
+</div>
+""" + SHARED_SCRIPTS + """
+</body></html>"""
+
+# ============================================================
+# RESET PASSWORD TEMPLATE
+# ============================================================
+RESET_PASSWORD_TEMPLATE = """<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reset Password — ThreatIntel Analyzer 2.0</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+""" + PWA_HEAD + THEME_CSS + """
+</head>
+<body>
+""" + SHARED_NAVBAR + """
+<div class="auth-wrap">
+  <div class="auth-card">
+    <div class="text-center mb-4">
+      <div style="width:60px;height:60px;background:linear-gradient(135deg,#10b981,#0284c7);border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 1rem;font-size:1.6rem">🔒</div>
+      <h3 class="fw-800 mb-1" style="color:var(--text);font-weight:800">Set New Password</h3>
+      <p style="color:var(--muted);font-size:.88rem">Choose a strong password for your account</p>
+    </div>
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% for cat,msg in msgs %}
+      <div class="flash-alert flash-{{ cat }}"><i class="bi bi-info-circle me-2"></i>{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+    <form method="POST" action="/reset-password/{{ token }}" onsubmit="return validateReset()">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <div class="mb-3">
+        <label class="form-label small fw-600" style="color:var(--muted)">New Password</label>
+        <div class="position-relative">
+          <i class="bi bi-lock position-absolute" style="left:.9rem;top:50%;transform:translateY(-50%);color:var(--muted)"></i>
+          <input type="password" name="password" id="rPwd" class="si ps-5" placeholder="Min 8 characters"
+            required minlength="8" oninput="checkStrength(this.value)" autofocus>
+        </div>
+        <div class="mt-2">
+          <div class="pwd-bar" id="pwdBar"></div>
+          <div class="d-flex justify-content-between mt-1">
+            <span class="pwd-label" id="pwdLabel" style="color:var(--muted)">Enter password</span>
+            <span class="pwd-label" id="pwdScore" style="color:var(--muted)"></span>
+          </div>
+        </div>
+      </div>
+      <div class="mb-4">
+        <label class="form-label small fw-600" style="color:var(--muted)">Confirm New Password</label>
+        <div class="position-relative">
+          <i class="bi bi-lock-fill position-absolute" style="left:.9rem;top:50%;transform:translateY(-50%);color:var(--muted)"></i>
+          <input type="password" name="confirm_password" id="rConf" class="si ps-5"
+            placeholder="Repeat new password" required minlength="8">
+        </div>
+      </div>
+      <button type="submit" class="btn-accent w-100 py-2 mb-3" style="font-size:1rem">
+        <i class="bi bi-check-circle-fill me-2"></i>Update Password
+      </button>
+    </form>
+    <div class="mt-3 p-3" style="background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.2);border-radius:10px">
+      <div style="font-size:.75rem;color:var(--muted);text-align:center">
+        <i class="bi bi-shield-lock me-1" style="color:#10b981"></i>New password hashed with PBKDF2-SHA256 &middot; Old password immediately invalidated
+      </div>
+    </div>
+  </div>
+</div>
+""" + SHARED_SCRIPTS + """
+<script>
+function checkStrength(p){
+  const bar=document.getElementById('pwdBar');const lbl=document.getElementById('pwdLabel');const sc=document.getElementById('pwdScore');
+  if(!p){bar.style.width='0%';lbl.innerText='Enter password';lbl.style.color='var(--muted)';return;}
+  let s=0;
+  if(p.length>=8)s+=1;if(p.length>=12)s+=1;
+  if(/[A-Z]/.test(p))s+=1;if(/[0-9]/.test(p))s+=1;if(/[^A-Za-z0-9]/.test(p))s+=1;
+  const map={1:{c:'#ef4444',l:'Too Weak',w:'20%'},2:{c:'#f97316',l:'Weak',w:'40%'},3:{c:'#f59e0b',l:'Medium',w:'60%'},4:{c:'#10b981',l:'Strong',w:'80%'},5:{c:'#10b981',l:'Very Strong',w:'100%'}};
+  const m=map[Math.max(1,s)];
+  bar.style.width=m.w;bar.style.background=m.c;lbl.innerText=m.l;lbl.style.color=m.c;sc.innerText=s+'/5';
+}
+function validateReset(){
+  const p=document.getElementById('rPwd').value;
+  const c=document.getElementById('rConf').value;
   if(p!==c){alert('Passwords do not match!');return false;}
   if(p.length<8){alert('Password must be at least 8 characters!');return false;}
   return true;
@@ -1390,8 +1784,15 @@ function dispResult(d){
   document.getElementById('resRep').innerText=d.reputation||'Unknown';document.getElementById('resRep').className=`ms-1 rep-${(d.reputation||'unknown').toLowerCase()}`;
   animGauge(d.risk_score||0);
   const vt=d.virustotal;document.getElementById('vVT').innerText=(vt&&vt.total)?`${vt.detections}/${vt.total}`:(vt?.status||'0/0');document.getElementById('vVT').style.color=rc(d.risk_score);
-  const ab=d.abuseipdb;document.getElementById('vAb').innerText=(ab&&ab.confidence!==undefined)?`${ab.confidence}%`:'N/A';document.getElementById('vRep').innerText=(ab&&ab.reports!==undefined)?`${ab.reports}`:'N/A';
-  const ws=d.whois||{};document.getElementById('vReg').innerText=ws.registrar||ab?.isp||'—';document.getElementById('vDom').innerText=ws.creation_date?fmtD(ws.creation_date):'—';document.getElementById('vPorts').innerText=(d.open_ports&&d.open_ports.length)?d.open_ports.join(', '):'None';
+  const ab=d.abuseipdb;
+  document.getElementById('vAb').innerText=(ab&&ab.confidence!==undefined)?`${ab.confidence}%`:'N/A';
+  document.getElementById('vRep').innerText=(ab&&ab.reports!==undefined)?`${ab.reports}`:'N/A';
+  // ISP: prefer isp_resolved (backend computed), then ab.isp, then vt.as_owner, then ws.registrar
+  const ws=d.whois||{};
+  const ispVal = d.isp_resolved || ab?.isp || d.virustotal?.as_owner || ws.registrar || '—';
+  document.getElementById('vReg').innerText=ispVal;
+  document.getElementById('vDom').innerText=ws.creation_date?fmtD(ws.creation_date):'—';
+  document.getElementById('vPorts').innerText=(d.open_ports&&d.open_ports.length)?d.open_ports.join(', '):'None';
   document.getElementById('aiText').innerText=d.ai_narrative||'';
   document.getElementById('aiRecs').innerHTML=(d.soc_actions||[]).map(a=>`<span class="badge" style="background:var(--card2);border:1px solid #3b82f6;color:#93c5fd;padding:.35rem .6rem;margin:.2rem"><i class="bi bi-shield-check me-1"></i>${esc(a)}</span>`).join('');
   document.getElementById('resDefang').innerText=d.defanged||d.indicator;
@@ -1495,9 +1896,18 @@ class ThreatIntelAnalyzer:
                 if row:
                     ca = datetime.fromisoformat(str(row["created_at"]).replace('Z','').split('.')[0])
                     if datetime.utcnow() - ca < timedelta(hours=self.CACHE_TTL_HOURS):
-                        d = json.loads(row["json_response"]); d["from_cache"] = True; return d
-        except Exception: pass
+                        d = json.loads(row["json_response"])
+                        # Skip incomplete cache: if BOTH VT and AbuseIPDB are None,
+                        # it was cached during an API failure — force a fresh fetch
+                        if d.get("virustotal") is None and d.get("abuseipdb") is None:
+                            logger.info(f"Cache SKIP (incomplete result) for {indicator} — will re-fetch")
+                            return None
+                        d["from_cache"] = True
+                        return d
+        except Exception:
+            pass
         return None
+
 
     def cache_result(self, indicator, data):
         try:
@@ -1538,51 +1948,148 @@ class ThreatIntelAnalyzer:
         if re.match(r'^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$',ind): return "url"
         return "unknown"
 
-    def query_virustotal(self,indicator):
+    def query_virustotal(self, indicator):
         self.load_api_keys()
-        if not REQUESTS_OK or not self.vt_key: return None
-        itype=self.classify_indicator(indicator)
-        hdrs={"x-apikey":self.vt_key,"Accept":"application/json"}
-        if itype in ("md5","sha1","sha256"): ep=f"https://www.virustotal.com/api/v3/files/{indicator}"
-        elif itype=="ipv4": ep=f"https://www.virustotal.com/api/v3/ip_addresses/{indicator}"
+        if not REQUESTS_OK:
+            logger.warning("VirusTotal: requests library not available")
+            return None
+        if not self.vt_key:
+            logger.warning("VirusTotal: VT_API_KEY not set in .env")
+            return None
+        itype = self.classify_indicator(indicator)
+        hdrs = {"x-apikey": self.vt_key, "Accept": "application/json"}
+        if itype in ("md5", "sha1", "sha256"):
+            ep = f"https://www.virustotal.com/api/v3/files/{indicator}"
+        elif itype == "ipv4":
+            ep = f"https://www.virustotal.com/api/v3/ip_addresses/{indicator}"
         else:
-            dom=re.sub(r'^https?://','',indicator).split('/')[0].split('?')[0]
-            ep=f"https://www.virustotal.com/api/v3/domains/{dom}"
+            dom = re.sub(r'^https?://', '', indicator).split('/')[0].split('?')[0].split(':')[0]
+            ep = f"https://www.virustotal.com/api/v3/domains/{dom}"
         try:
-            r=req_lib.get(ep,headers=hdrs,timeout=self.TIMEOUT)
-            if r.status_code==200:
-                attr=r.json().get("data",{}).get("attributes",{}); stats=attr.get("last_analysis_stats",{})
-                return {"detections":stats.get("malicious",0),"total":sum(stats.values()) if stats else 0,"scan_date":attr.get("last_analysis_date",int(time.time()))}
-            elif r.status_code==404: return {"detections":0,"total":0,"status":"Not Seen / Clean"}
-        except Exception: pass
-        return None
+            r = req_lib.get(ep, headers=hdrs, timeout=self.TIMEOUT)
+            logger.info(f"VirusTotal API → {ep} | Status: {r.status_code}")
+            if r.status_code == 200:
+                body = r.json()
+                attr = body.get("data", {}).get("attributes", {})
+                stats = attr.get("last_analysis_stats", {})
+                malicious = stats.get("malicious", 0)
+                suspicious = stats.get("suspicious", 0)
+                total = sum(stats.values()) if stats else 0
+                scan_date = attr.get("last_analysis_date", int(time.time()))
+                # For IPs: also grab network/ASN info
+                asn = attr.get("asn", None)
+                as_owner = attr.get("as_owner", None)
+                country = attr.get("country", None)
+                result = {
+                    "detections": malicious + suspicious,
+                    "malicious": malicious,
+                    "suspicious": suspicious,
+                    "total": total,
+                    "scan_date": scan_date,
+                }
+                if asn:       result["asn"] = asn
+                if as_owner:  result["as_owner"] = as_owner
+                if country:   result["country"] = country
+                return result
+            elif r.status_code == 404:
+                logger.info(f"VirusTotal: indicator not found (clean) — {indicator}")
+                return {"detections": 0, "malicious": 0, "suspicious": 0, "total": 0, "status": "Not Seen / Clean"}
+            elif r.status_code == 401:
+                logger.error(f"VirusTotal: API key invalid or expired (401). Check VT_API_KEY in .env")
+                return None
+            elif r.status_code == 429:
+                logger.warning("VirusTotal: Rate limit exceeded (429). Free tier = 4 req/min.")
+                return {"detections": 0, "total": 0, "status": "Rate Limited — retry in 60s"}
+            else:
+                logger.error(f"VirusTotal: Unexpected HTTP {r.status_code} — {r.text[:200]}")
+                return None
+        except req_lib.exceptions.Timeout:
+            logger.error(f"VirusTotal: Request timed out after {self.TIMEOUT}s for {indicator}")
+            return None
+        except Exception as exc:
+            logger.exception(f"VirusTotal: Unexpected error for {indicator}: {exc}")
+            return None
 
-    def query_abuseipdb(self,indicator):
+    def query_abuseipdb(self, indicator):
         self.load_api_keys()
-        if not REQUESTS_OK or not self.abuse_key: return None
-        if self.classify_indicator(indicator)!="ipv4": return None
+        if not REQUESTS_OK:
+            logger.warning("AbuseIPDB: requests library not available")
+            return None
+        if not self.abuse_key:
+            logger.warning("AbuseIPDB: ABUSEIPDB_KEY not set in .env")
+            return None
+        if self.classify_indicator(indicator) != "ipv4":
+            return None
         try:
-            r=req_lib.get("https://api.abuseipdb.com/api/v2/check",
-                headers={"Key":self.abuse_key,"Accept":"application/json"},
-                params={"ipAddress":indicator,"maxAgeInDays":90},timeout=self.TIMEOUT)
-            if r.status_code==200:
-                d=r.json().get("data",{})
-                return {"confidence":d.get("abuseConfidenceScore",0),"reports":d.get("totalReports",0),"country":d.get("countryCode","—"),"isp":d.get("isp","—")}
-        except Exception: pass
-        return None
+            r = req_lib.get(
+                "https://api.abuseipdb.com/api/v2/check",
+                headers={"Key": self.abuse_key, "Accept": "application/json"},
+                params={"ipAddress": indicator, "maxAgeInDays": 90, "verbose": ""},
+                timeout=self.TIMEOUT
+            )
+            logger.info(f"AbuseIPDB API → /check | IP: {indicator} | Status: {r.status_code}")
+            if r.status_code == 200:
+                d = r.json().get("data", {})
+                isp_val   = d.get("isp") or d.get("domain") or "—"
+                return {
+                    "confidence": d.get("abuseConfidenceScore", 0),
+                    "reports":    d.get("totalReports", 0),
+                    "country":    d.get("countryCode", "—"),
+                    "isp":        isp_val,
+                    "domain":     d.get("domain", "—"),
+                    "usage":      d.get("usageType", "—"),
+                    "hostnames":  d.get("hostnames", [])[:3],
+                    "is_tor":     d.get("isTor", False),
+                    "is_public":  d.get("isPublic", True),
+                }
+            elif r.status_code == 401:
+                logger.error("AbuseIPDB: Invalid API key (401). Check ABUSEIPDB_KEY in .env")
+                return None
+            elif r.status_code == 429:
+                logger.warning("AbuseIPDB: Daily quota exceeded (429)")
+                return {"confidence": 0, "reports": 0, "country": "—", "isp": "Rate limited", "status": "Quota Exceeded"}
+            elif r.status_code == 422:
+                logger.warning(f"AbuseIPDB: Invalid IP format for {indicator}")
+                return None
+            else:
+                logger.error(f"AbuseIPDB: HTTP {r.status_code} — {r.text[:200]}")
+                return None
+        except req_lib.exceptions.Timeout:
+            logger.error(f"AbuseIPDB: Request timed out for {indicator}")
+            return None
+        except Exception as exc:
+            logger.exception(f"AbuseIPDB: Unexpected error for {indicator}: {exc}")
+            return None
 
-    def query_whois(self,indicator):
-        if not WHOIS_OK: return None
-        if self.classify_indicator(indicator) not in ("url","unknown"): return None
-        dom=re.sub(r'^https?://','',indicator).split('/')[0].split(':')[0]
+    def query_whois(self, indicator):
+        if not WHOIS_OK:
+            return None
+        itype = self.classify_indicator(indicator)
+        if itype not in ("url", "unknown"):
+            return None
+        dom = re.sub(r'^https?://', '', indicator).split('/')[0].split(':')[0].strip()
+        # Don't run WHOIS on IPs (handled by AbuseIPDB) or invalid domains
+        if not dom or re.match(r'^\d+\.\d+\.\d+\.\d+$', dom):
+            return None
         try:
-            w=python_whois.whois(dom)
+            w = python_whois.whois(dom)
             def cd(d):
-                x=d[0] if isinstance(d,list) else d
-                return x.isoformat() if hasattr(x,"isoformat") else str(d) if d else None
-            return {"registrar":str(w.registrar) if w.registrar else None,"creation_date":cd(w.creation_date),"expiration_date":cd(w.expiration_date),"name_servers":list(w.name_servers)[:4] if w.name_servers else []}
-        except Exception: pass
-        return None
+                x = d[0] if isinstance(d, list) else d
+                return x.isoformat() if hasattr(x, "isoformat") else str(d) if d else None
+            registrar = str(w.registrar).strip() if w.registrar else None
+            creation  = cd(w.creation_date)
+            expiry    = cd(w.expiration_date)
+            ns        = list(w.name_servers)[:4] if w.name_servers else []
+            logger.info(f"WHOIS → {dom} | Registrar: {registrar} | Created: {creation}")
+            return {
+                "registrar":       registrar,
+                "creation_date":   creation,
+                "expiration_date": expiry,
+                "name_servers":    ns,
+            }
+        except Exception as exc:
+            logger.debug(f"WHOIS query failed for {dom}: {exc}")
+            return None
 
     def calculate_risk_score(self,data):
         s=0.0
@@ -1617,41 +2124,137 @@ class ThreatIntelAnalyzer:
             return f'drop tcp any any -> any $HTTP_PORTS (msg:"THREATINTEL: Blocked domain [{dom}]"; content:"Host|3A| {dom}"; sid:{sid}; rev:1;)'
         return f'alert tcp any any -> any any (msg:"THREATINTEL: Hash Alert [{indicator[:16]}...]"; sid:{sid}; rev:1;)'
 
-    def generate_ai_narrative(self,indicator,itype,score,vt,ab):
-        vd=vt.get("detections",0) if vt else 0; ac=ab.get("confidence",0) if ab else 0
-        if score>=75 or vd>=10 or ac>=70:
-            return (f"CRITICAL THREAT ADVISORY: '{indicator}' has confirmed malicious weaponization. Multi-engine feeds link this asset to active C2 communication. Immediate containment is mandatory."),["Enforce edge firewall & DNS sinkhole blocking","Isolate endpoints via EDR containment","Force credential resets & revoke session tokens","Retro-hunt SIEM logs for past 30 days"]
-        elif score>=40:
-            return (f"SUSPICIOUS ACTIVITY: '{indicator}' shows anomalous behavior patterns. Warrants proactive monitoring."),["Add to SIEM high-priority watchlist","Inspect historical firewall/DNS logs","Alert Tier-1 SOC analysts"]
-        return (f"BENIGN / BASELINE: '{indicator}' shows standard characteristics with negligible detections."),["Maintain standard firewall logging","No active containment required"]
+    def generate_ai_narrative(self, indicator, itype, score, vt, ab):
+        vd = vt.get("detections", 0) if vt else 0
+        ac = ab.get("confidence", 0) if ab else 0
+        is_tor = ab.get("is_tor", False) if ab else False
+        reports = ab.get("reports", 0) if ab else 0
+        country = ab.get("country", "unknown") if ab else "unknown"
 
-    def enrich_indicator(self,indicator):
-        indicator=indicator.strip()
-        cached=self.check_cache(indicator)
-        if cached: return cached
+        tor_note = f" This IP is a known Tor exit node (country: {country})." if is_tor else ""
+        if score >= 75 or vd >= 10 or ac >= 70:
+            return (
+                f"CRITICAL THREAT ADVISORY: '{indicator}' has confirmed malicious weaponization.{tor_note} "
+                f"Multi-engine feeds ({vd}/{vt.get('total', 0) if vt else 0} AV detections, "
+                f"AbuseIPDB confidence {ac}%, {reports} abuse reports) link this asset to active C2 communication. "
+                f"Immediate containment is mandatory."
+            ), [
+                "Enforce edge firewall & DNS sinkhole blocking",
+                "Isolate endpoints via EDR containment",
+                "Force credential resets & revoke session tokens",
+                "Retro-hunt SIEM logs for past 30 days",
+            ]
+        elif score >= 40 or is_tor:
+            tor_warn = "Tor exit node detected — all traffic through this IP is anonymized. " if is_tor else ""
+            return (
+                f"SUSPICIOUS ACTIVITY: '{indicator}' shows anomalous behavior patterns. "
+                f"{tor_warn}AbuseIPDB confidence: {ac}%, reports: {reports}. Warrants proactive monitoring."
+            ), [
+                "Add to SIEM high-priority watchlist",
+                "Inspect historical firewall/DNS logs",
+                "Alert Tier-1 SOC analysts",
+            ]
+        return (
+            f"BENIGN / BASELINE: '{indicator}' shows standard characteristics with negligible detections "
+            f"({vd}/{vt.get('total', 0) if vt else 0} AV engines, AbuseIPDB confidence {ac}%)."
+        ), [
+            "Maintain standard firewall logging",
+            "No active containment required",
+        ]
+
+    def enrich_indicator(self, indicator):
+        indicator = indicator.strip()
+
+        # Check cache first
+        cached = self.check_cache(indicator)
+        if cached:
+            logger.info(f"Cache HIT for {indicator}")
+            return cached
+
+        logger.info(f"Enriching indicator: {indicator}")
         self.load_api_keys()
-        itype=self.classify_indicator(indicator)
-        result={"indicator":indicator,"indicator_type":itype,"from_cache":False,"open_ports":["80 (HTTP)","443 (HTTPS)"] if itype=="ipv4" else []}
-        result["virustotal"]=self.query_virustotal(indicator)
-        result["abuseipdb"]=self.query_abuseipdb(indicator)
-        result["whois"]=self.query_whois(indicator)
-        score,level,rep=self.calculate_risk_score(result)
-        result["risk_score"]=score; result["threat_level"]=level; result["reputation"]=rep
-        ttps=[]
-        if itype in ("url","unknown"): ttps.extend([MITRE_DATABASE[0],MITRE_DATABASE[1]])
-        if itype=="ipv4": ttps.extend([MITRE_DATABASE[5],MITRE_DATABASE[6]])
-        if itype in ("md5","sha1","sha256") or score>=60: ttps.extend([MITRE_DATABASE[2],MITRE_DATABASE[4],MITRE_DATABASE[7]])
-        result["mitre_ttps"]=list({t["id"]:t for t in ttps}.values())
-        seed=int(hashlib.md5(indicator.encode()).hexdigest(),16)
-        result["threat_actors"]=[KNOWN_ACTORS[seed%len(KNOWN_ACTORS)]] if score>=40 else []
-        narrative,actions=self.generate_ai_narrative(indicator,itype,score,result["virustotal"],result["abuseipdb"])
-        result["ai_narrative"]=narrative; result["soc_actions"]=actions
-        result["yara_rule"]=self.generate_yara_rule(indicator,itype,score)
-        result["snort_rule"]=self.generate_snort_rule(indicator,itype)
-        result["siem_queries"]=generate_siem_queries(indicator,itype)
-        result["defanged"]=defang(indicator,itype)
-        self.cache_result(indicator,result)
+        itype = self.classify_indicator(indicator)
+
+        result = {
+            "indicator":      indicator,
+            "indicator_type": itype,
+            "from_cache":     False,
+            "open_ports":     [],
+        }
+
+        # Query all intelligence sources in parallel (sequential for simplicity, thread-safe)
+        result["virustotal"] = self.query_virustotal(indicator)
+        result["abuseipdb"]  = self.query_abuseipdb(indicator)
+        result["whois"]      = self.query_whois(indicator)
+
+        # Build ISP/registrar field from best available source
+        vt_data  = result.get("virustotal") or {}
+        ab_data  = result.get("abuseipdb") or {}
+        ws_data  = result.get("whois") or {}
+
+        # Open ports: for IPs use static well-known defaults (Shodan would be needed for real scan)
+        if itype == "ipv4":
+            ports = ["80 (HTTP)", "443 (HTTPS)"]
+            if ab_data.get("is_tor"):
+                ports.append("9001 (Tor)")
+            result["open_ports"] = ports
+        else:
+            result["open_ports"] = []
+
+        # ISP fallback chain: AbuseIPDB → VT ASN owner → VT country → "—"
+        isp = ab_data.get("isp") or vt_data.get("as_owner") or "—"
+        result["isp_resolved"] = isp
+
+        # Compute risk score
+        score, level, rep = self.calculate_risk_score(result)
+
+        # Boost score if TOR exit node detected
+        if ab_data.get("is_tor") and score < 40:
+            score = max(score, 35)
+            level = "Medium"
+            rep   = "Suspicious"
+        result["risk_score"]   = score
+        result["threat_level"] = level
+        result["reputation"]   = rep
+
+        # MITRE ATT&CK TTPs
+        ttps = []
+        if itype in ("url", "unknown"):
+            ttps.extend([MITRE_DATABASE[0], MITRE_DATABASE[1]])
+        if itype == "ipv4":
+            ttps.extend([MITRE_DATABASE[5], MITRE_DATABASE[6]])
+        if itype in ("md5", "sha1", "sha256") or score >= 60:
+            ttps.extend([MITRE_DATABASE[2], MITRE_DATABASE[4], MITRE_DATABASE[7]])
+        result["mitre_ttps"] = list({t["id"]: t for t in ttps}.values())
+
+        # Threat actor attribution (deterministic seed from indicator hash)
+        seed = int(hashlib.md5(indicator.encode()).hexdigest(), 16)
+        result["threat_actors"] = [KNOWN_ACTORS[seed % len(KNOWN_ACTORS)]] if score >= 40 else []
+
+        # AI narrative
+        narrative, actions = self.generate_ai_narrative(
+            indicator, itype, score, result["virustotal"], result["abuseipdb"]
+        )
+        result["ai_narrative"] = narrative
+        result["soc_actions"]  = actions
+
+        # Detection signatures
+        result["yara_rule"]    = self.generate_yara_rule(indicator, itype, score)
+        result["snort_rule"]   = self.generate_snort_rule(indicator, itype)
+        result["siem_queries"] = generate_siem_queries(indicator, itype)
+        result["defanged"]     = defang(indicator, itype)
+
+        # Log enrichment summary
+        logger.info(
+            f"Enrichment complete | {indicator} | Type: {itype} | Score: {score} | "
+            f"Level: {level} | VT: {vt_data.get('detections','?')}/{vt_data.get('total','?')} | "
+            f"Abuse: {ab_data.get('confidence','?')}%"
+        )
+
+        # Cache result
+        self.cache_result(indicator, result)
         return result
+
 
     def generate_pdf(self,indicator,data):
         if not REPORTLAB_OK: raise RuntimeError("pip install reportlab")
@@ -1766,6 +2369,22 @@ analyzer=ThreatIntelAnalyzer()
 # ============================================================
 # FLASK ROUTES
 # ============================================================
+
+@app.before_request
+def refresh_session():
+    """
+    Called before EVERY request.
+    - Keeps session permanent (365 days) on every visit.
+    - Ensures the session cookie expiry is reset on each request,
+      so the user stays logged in as long as they visit at least once per year.
+    """
+    from flask import session as _s
+    _s.permanent = True
+    # flask_login's remember cookie handles cross-restart persistence;
+    # marking modified here forces the browser to receive a fresh Set-Cookie
+    # with the updated Max-Age so the timer never counts down to zero.
+    _s.modified = True
+
 @app.route("/")
 def home():
     return render_template_string(HOME_TEMPLATE)
@@ -1774,14 +2393,32 @@ def home():
 def login_page():
     if current_user.is_authenticated: return redirect(url_for("analyzer_page"))
     if request.method=="POST":
+        # CSRF validation
+        if not validate_csrf_token():
+            flash("Security validation failed. Please try again.","error")
+            return render_template_string(LOGIN_TEMPLATE)
         email=request.form.get("email","").strip()
         password=request.form.get("password","")
+        # Note: remember checkbox is kept in UI but we ALWAYS remember permanently
+        # (user can only log out by explicitly clicking Logout)
+        if not email or not password:
+            flash("Email and password are required.","error")
+            return render_template_string(LOGIN_TEMPLATE)
         row=db_get_user_by_email(email)
         if row and check_password_hash(row["password_hash"],password):
             u=User(row["id"],row["username"],row["email"],row["role"])
-            login_user(u,remember=bool(request.form.get("remember")))
-            db_log_activity(u.id,u.username,"login","{}",request.remote_addr)
-            return redirect(url_for("analyzer_page"))
+            # Always remember=True → writes a persistent 365-day cookie
+            login_user(u, remember=True)
+            # Mark session as permanent → uses PERMANENT_SESSION_LIFETIME (365 days)
+            from flask import session as flask_session
+            flask_session.permanent = True
+            flask_session.modified  = True   # Force Flask to write the Set-Cookie header
+            db_log_activity(u.id,u.username,"login","permanent_session",request.remote_addr)
+            next_page=request.args.get("next")
+            return redirect(next_page if next_page and next_page.startswith("/") else url_for("analyzer_page"))
+
+        # Log failed attempt (with no user_id since login failed)
+        db_log_activity(0,"unknown","login_failed",f"Failed attempt for: {email}",request.remote_addr)
         flash("Invalid email or password. Please try again.","error")
     return render_template_string(LOGIN_TEMPLATE)
 
@@ -1789,36 +2426,131 @@ def login_page():
 def signup_page():
     if current_user.is_authenticated: return redirect(url_for("analyzer_page"))
     if request.method=="POST":
+        # CSRF validation
+        if not validate_csrf_token():
+            flash("Security validation failed. Please try again.","error")
+            return render_template_string(SIGNUP_TEMPLATE)
         username=request.form.get("username","").strip()
-        email=request.form.get("email","").strip()
+        email=request.form.get("email","").strip().lower()
         password=request.form.get("password","")
         confirm=request.form.get("confirm_password","")
+        # Validate username: 3-30 chars, alphanumeric + underscore only
         if not username or len(username)<3:
             flash("Username must be at least 3 characters.","error")
-        elif not email:
-            flash("Valid email is required.","error")
+        elif len(username)>30:
+            flash("Username must be 30 characters or fewer.","error")
+        elif not re.match(r'^[a-zA-Z0-9_]+$', username):
+            flash("Username may only contain letters, numbers, and underscores.","error")
+        elif not email or "@" not in email:
+            flash("Valid email address is required.","error")
         elif password!=confirm:
             flash("Passwords do not match.","error")
         elif len(password)<8:
             flash("Password must be at least 8 characters.","error")
+        elif db_get_user_by_username(username):
+            flash("This username is already taken. Please choose another.","error")
         elif db_get_user_by_email(email):
             flash("This email is already registered. Please login.","error")
         else:
             uid=db_create_user(username,email,generate_password_hash(password))
             if uid:
-                db_log_activity(uid,username,"signup","{}",request.remote_addr)
+                db_log_activity(uid,username,"signup","",request.remote_addr)
                 flash("Account created successfully! Please sign in.","success")
                 return redirect(url_for("login_page"))
-            flash("Registration failed. Please try again.","error")
+            flash("Registration failed. Username or email may already be in use.","error")
     return render_template_string(SIGNUP_TEMPLATE)
 
 @app.route("/logout")
 @login_required
 def logout():
-    db_log_activity(current_user.id,current_user.username,"logout","{}",request.remote_addr)
+    db_log_activity(current_user.id,current_user.username,"logout","",request.remote_addr)
     logout_user()
     flash("You have been logged out successfully.","success")
     return redirect(url_for("login_page"))
+
+# ── Forgot Password ────────────────────────────────────────────────────────────
+@app.route("/forgot-password", methods=["GET","POST"])
+def forgot_password():
+    if current_user.is_authenticated:
+        return redirect(url_for("analyzer_page"))
+    if request.method == "POST":
+        if not validate_csrf_token():
+            flash("Security validation failed. Please try again.","error")
+            return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+
+        # Rate limiting: max requests per IP to prevent spamming
+        client_ip = request.remote_addr or "unknown"
+        if not check_rate_limit(client_ip):
+            flash("Too many requests. Please wait a minute before requesting another reset link.","error")
+            return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+
+        email = request.form.get("email","").strip().lower()
+        if not email:
+            flash("Please enter your email address.","error")
+            return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+
+        row = db_get_user_by_email(email)
+        if row:
+            token = db_create_reset_token(row["id"])
+            if token:
+                app_url = os.environ.get("APP_URL","http://localhost:5000").rstrip("/")
+                reset_link = f"{app_url}/reset-password/{token}"
+                sent = send_reset_email(email, row["username"], reset_link)
+                if sent:
+                    db_log_activity(row["id"], row["username"], "forgot_password", "reset_email_sent_to_inbox", request.remote_addr)
+                    logger.info("✅ Password reset email dispatched to %s", email)
+                else:
+                    # Email not configured in .env:
+                    # ⚠️ SECURITY: NEVER display the link on the public browser screen!
+                    # Print it ONLY to the server owner's private terminal console for local debugging.
+                    logger.warning("=" * 60)
+                    logger.warning("🔑 [LOCAL SERVER CONSOLE ONLY] PASSWORD RESET LINK:")
+                    logger.warning("Target Email: %s | User: %s", email, row["username"])
+                    logger.warning("Reset URL   : %s", reset_link)
+                    logger.warning("(This is logged ONLY here on the server terminal so no browser user can steal it)")
+                    logger.warning("=" * 60)
+                    db_log_activity(row["id"], row["username"], "forgot_password", "reset_token_logged_to_console", request.remote_addr)
+
+        # ⚠️ CRITICAL SECURITY (Anti-Account Takeover & Anti-Enumeration):
+        # Always return this exact generic message in the browser UI, regardless of whether
+        # the email exists or not. An attacker can NEVER see the link on screen!
+        flash("If an account with that email exists, a password reset link has been sent to that email address. Please check your inbox (and spam folder).", "success")
+    return render_template_string(FORGOT_PASSWORD_TEMPLATE)
+
+# ── Reset Password ─────────────────────────────────────────────────────────────
+@app.route("/reset-password/<token>", methods=["GET","POST"])
+def reset_password(token):
+    if current_user.is_authenticated:
+        return redirect(url_for("analyzer_page"))
+    # Validate token on every request
+    token_row = db_get_reset_token(token)
+    if not token_row:
+        flash("This password reset link is invalid or has expired. Please request a new one.","error")
+        return redirect(url_for("forgot_password"))
+    if request.method == "POST":
+        if not validate_csrf_token():
+            flash("Security validation failed. Please try again.","error")
+            return render_template_string(RESET_PASSWORD_TEMPLATE, token=token)
+        password    = request.form.get("password","")
+        confirm     = request.form.get("confirm_password","")
+        if len(password) < 8:
+            flash("Password must be at least 8 characters.","error")
+            return render_template_string(RESET_PASSWORD_TEMPLATE, token=token)
+        if password != confirm:
+            flash("Passwords do not match.","error")
+            return render_template_string(RESET_PASSWORD_TEMPLATE, token=token)
+        # Update password and invalidate token
+        user_id = token_row["user_id"]
+        new_hash = generate_password_hash(password)
+        if db_update_password(user_id, new_hash):
+            db_use_reset_token(token)
+            user_row = db_get_user_by_id(user_id)
+            uname = user_row["username"] if user_row else "unknown"
+            db_log_activity(user_id, uname, "password_reset", "password_changed_via_reset_link", request.remote_addr)
+            flash("Password updated successfully! You can now sign in with your new password.","success")
+            return redirect(url_for("login_page"))
+        flash("Failed to update password. Please try again.","error")
+    return render_template_string(RESET_PASSWORD_TEMPLATE, token=token)
 
 @app.route("/analyzer")
 @login_required
@@ -1828,7 +2560,12 @@ def analyzer_page():
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    analyses=db_get_user_analyses(current_user.id)
+    rows=db_get_user_analyses(current_user.id)
+    # Convert rows to dicts with str-formatted datetimes (compatible with SQLite + PostgreSQL)
+    analyses=[dict(r) if hasattr(r,"keys") else r for r in rows]
+    for a in analyses:
+        if a.get("analyzed_at") and not isinstance(a["analyzed_at"],str):
+            a["analyzed_at"]=a["analyzed_at"].strftime("%Y-%m-%d %H:%M:%S")
     return render_template_string(DASHBOARD_TEMPLATE,analyses=analyses)
 
 @app.route("/admin/logs")
@@ -1836,25 +2573,69 @@ def dashboard():
 def admin_logs():
     if not current_user.is_admin:
         flash("Admin access required.","error"); return redirect(url_for("home"))
-    logs=db_get_all_logs()
-    all_analyses=db_get_all_analyses()
-    users=db_get_all_users()
+    def _to_str_dt(rows, field):
+        """Convert a datetime field to string in list of dicts"""
+        result=[]
+        for r in rows:
+            d=dict(r) if hasattr(r,"keys") else r
+            if d.get(field) and not isinstance(d[field],str):
+                d[field]=d[field].strftime("%Y-%m-%d %H:%M:%S")
+            result.append(d)
+        return result
+    logs=_to_str_dt(db_get_all_logs(),"created_at")
+    all_analyses=_to_str_dt(db_get_all_analyses(),"analyzed_at")
+    users=_to_str_dt(db_get_all_users(),"created_at")
     stats=db_get_admin_stats()
     return render_template_string(ADMIN_LOGS_TEMPLATE,logs=logs,all_analyses=all_analyses,users=users,stats=stats)
 
 @app.route("/api/status")
 def api_status():
     analyzer.load_api_keys()
-    return jsonify({"apis_configured":(1 if analyzer.vt_key else 0)+(1 if analyzer.abuse_key else 0)})
+    vt_ok    = bool(analyzer.vt_key and len(analyzer.vt_key) >= 32)
+    abuse_ok = bool(analyzer.abuse_key and len(analyzer.abuse_key) >= 32)
+    return jsonify({
+        "apis_configured": (1 if vt_ok else 0) + (1 if abuse_ok else 0),
+        "virustotal":       "✅ Configured" if vt_ok else "❌ Not configured",
+        "abuseipdb":        "✅ Configured" if abuse_ok else "❌ Not configured",
+        "whois":            "✅ Available" if WHOIS_OK else "⚠️ python-whois not installed",
+        "requests":         "✅ Available" if REQUESTS_OK else "❌ requests not installed",
+        "reportlab":        "✅ Available" if REPORTLAB_OK else "⚠️ reportlab not installed",
+    })
 
-@app.route("/api/extract-iocs",methods=["POST"])
+@app.route("/api/clear-cache", methods=["POST"])
+@login_required
+def clear_cache_ep():
+    """Clear cached analysis for a specific indicator so it's re-fetched fresh."""
+    if not current_user.is_admin:
+        return jsonify({"error": "Admin only"}), 403
+    p = request.get_json(silent=True) or {}
+    ind = p.get("indicator", "").strip()
+    try:
+        with get_db() as db:
+            if ind:
+                db.execute(_sql("DELETE FROM cache WHERE indicator=?"), (ind,))
+                return jsonify({"cleared": ind})
+            else:
+                db.execute("DELETE FROM cache")
+                return jsonify({"cleared": "all"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route("/api/extract-iocs", methods=["POST"])
 def extract_iocs_ep():
-    p=request.get_json(silent=True) or {}; t=p.get("text","").strip()
-    return jsonify({"iocs":analyzer.extract_iocs(t) if t else []})
+    p = request.get_json(silent=True) or {}
+    t = p.get("text", "").strip()
+    return jsonify({"iocs": analyzer.extract_iocs(t) if t else []})
 
 @app.route("/api/analyze",methods=["POST"])
 @login_required
 def analyze_ep():
+    # Rate limiting: max 30 requests per 60 seconds per IP
+    client_ip = request.remote_addr or "unknown"
+    if not check_rate_limit(client_ip):
+        return jsonify({"error":"Rate limit exceeded. Please wait 60 seconds before trying again."}),429
     p=request.get_json(silent=True) or {}; ind=p.get("indicator","").strip()
     if not ind: return jsonify({"error":"No indicator provided"}),400
     try:
@@ -1951,16 +2732,15 @@ def _get_icon_bytes():
     ihdr = struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)
     bw = 10; r1,g1,b1 = 9,12,21; r2,g2,b2 = 0,212,255
     cx,cy = size//2,size//2
-    rows = []
+    # Build raw scanlines: each row = filter_byte(0) + RGB_pixels
+    raw = b''
     for y in range(size):
-        row = b'\x00'
+        raw += b'\x00'  # PNG filter type 0 (None) per row
         for x in range(size):
             if x<bw or x>=size-bw or y<bw or y>=size-bw or ((x-cx)**2+(y-cy)**2)<=(size//6)**2:
-                row += bytes([r2,g2,b2])
+                raw += bytes([r2,g2,b2])
             else:
-                row += bytes([r1,g1,b1])
-        rows.append(row)
-    raw = b''.join(rows)
+                raw += bytes([r1,g1,b1])
     return sig + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''), "image/png"
 
 @app.route("/icon-192.png")
